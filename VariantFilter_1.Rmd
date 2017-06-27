@@ -1,0 +1,127 @@
+---
+title: "VCF Analysis 2"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Aim: Take the concatenated VCF file for each chromosome, and find SNPs/CNVs that are shared among mutant lines and absent in all control lines.
+
+In order to run 'Mpileup' in parallel we had split the task 'per-chromosome' and then run it on different nodes of the cluster. We now have already concatenated all these VCF files in the right order. Now we'll annotate the VCF file, compress it and then index it for quick access of small chunks to avoid putting too much load on our RAM. We'll then filter all the variants based on read depth and call quality and check to see if they are shared among mutants and absent in control or not.
+
+## 1) Initialize some common variables and load the necessary libraries
+
+```{r}
+library (VariantAnnotation)
+library("cn.mops")
+OUTDir <- "/media/rathodlab/Data_disk/NGS_home/MedGenome_May2017/MedGenome_LocalOutDir"
+VCFInputDir <- "/media/rathodlab/Data_disk/NGS_home/MedGenome_May2017/MedGenome_OutDir"
+VCF_Root_FileName <- "SN_May302017"
+```
+
+
+## 2) Annotate the VCF file
+
+```{r}
+SNPSIFT_DIR <- "/home/rathodlab/Documents/softwares_hawk/snp_eff_sift/snpEff"
+ConcatInFile <- paste0(VCFInputDir, "/", VCF_Root_FileName, ".AllChr.mpileup.calls.vcf")
+ConcatOutFile <- paste0(OUTDir, "/", VCF_Root_FileName, ".AllChr.mpileup.calls.annotated.vcf")
+if (!(file.exists(ConcatOutFile)))
+{
+  system (paste0 ("java -d64 -Xmx5G -jar ", SNPSIFT_DIR, "/snpEff.jar -v -ud 100 Pf3D7v90 ", ConcatInFile, " > ", ConcatOutFile))
+  print ("Done annotating")
+} else
+{
+  print (paste0(ConcatOutFile, ": File exists, not doing anything"))
+}
+
+```
+
+
+## 1) Compress and index concatenated VCF file
+
+Concatenated VCF file needs to be compressed using 'bgzip' in order to be indexed.
+
+```{r}
+PFChromosomes <- c("M76611", "PFC10_API_IRAB", "Pf3D7_01_v3", "Pf3D7_02_v3", "Pf3D7_03_v3", "Pf3D7_04_v3", "Pf3D7_05_v3", "Pf3D7_06_v3", "Pf3D7_07_v3", "Pf3D7_08_v3", "Pf3D7_09_v3", "Pf3D7_10_v3", "Pf3D7_11_v3", "Pf3D7_12_v3", "Pf3D7_13_v3", "Pf3D7_14_v3")
+### Check to see if compressed file exists
+if (!(file.exists(paste0(ConcatOutFile, ".gz"))))
+{
+  system (paste0 ("bgzip -c ", ConcatOutFile, " > ", ConcatOutFile, ".gz"), ignore.stdout = FALSE, ignore.stderr = FALSE)
+  print ("Done with compression.")
+  system (paste0 ("tabix -p vcf ", ConcatOutFile, ".gz"))
+  print ("Done with indexing")
+} else 
+{
+  print (paste0("File exists: ", ConcatOutFile, " Not concatenating."))
+}
+```
+
+
+## 3) Filter the variants 
+
+```{r}
+MyVCF <- readVcf(paste0(ConcatOutFile, ".gz"), genome = "Pf_3D7")
+ReadDepth <- geno(MyVCF)$DP
+RowIndex <- which (ReadDepth <= 10, arr.ind = T)[,1]
+RowIndex <- sort (unique (RowIndex))
+if (length(RowIndex) > 0 )
+{
+  MyVCF <- MyVCF[-RowIndex,]
+}
+HighQualIndex <- which (rowRanges(MyVCF)$QUAL >= 100)
+MyVCF <- MyVCF[HighQualIndex,]
+
+DVDPRatio <- geno(MyVCF)$DV/geno(MyVCF)$DP
+ControlSamplesIndex <- c(2,4,6)
+MutantSampleIndex <- c(1,3,5)
+RatioCutoff <- 0.99
+HighDvDPRatioIndex <- NULL
+for (i in MutantSampleIndex)
+{
+  if (i == MutantSampleIndex[1])
+  {
+    HighDvDPRatioIndex <- which(DVDPRatio[,i] > RatioCutoff)
+  } else
+  {
+    HighDvDPRatioIndex <- intersect (HighDvDPRatioIndex, which(DVDPRatio[,i] > RatioCutoff))
+  }
+  
+}
+
+LowControlRatio <- NULL
+for (i in ControlSamplesIndex)
+{
+  if (i == ControlSamplesIndex[1])
+  {
+    LowControlRatio <- which(DVDPRatio[,i] < 0.1)
+  } else
+  {
+    LowControlRatio <- intersect (LowControlRatio, which(DVDPRatio[,i] < 0.1))
+  }
+}
+FinalIndex <- intersect (HighDvDPRatioIndex, LowControlRatio)
+FinalIndex
+as.list(info(MyVCF)$EFF[FinalIndex])
+```
+
+## 4) Copy Number Variation Estimation
+
+```{r}
+BAMFiles = list.files (path = VCFInputDir, pattern = "recal.realigned.markeddups.merged.sorted.bwa.bam$", recursive = T, full.names = T)
+my_ref_seq_names = c("M76611", "PFC10_API_IRAB", "Pf3D7_01_v3", "Pf3D7_02_v3", "Pf3D7_03_v3", "Pf3D7_04_v3", "Pf3D7_05_v3", "Pf3D7_06_v3", "Pf3D7_07_v3", "Pf3D7_08_v3", "Pf3D7_09_v3", "Pf3D7_10_v3", "Pf3D7_11_v3", "Pf3D7_12_v3", "Pf3D7_13_v3", "Pf3D7_14_v3")
+my_sample_names = colnames (geno(MyVCf)$DP[1:5,])
+SamplesOfInterest = my_sample_names
+BAMIndex = NULL
+for (CurrentSample in SamplesOfInterest)
+{
+  BAMIndex = c(BAMIndex, grep (BAMFiles, pattern = CurrentSample))
+  
+}
+bamDataRanges_sams = getReadCountsFromBAM (BAMFiles[BAMIndex], sampleNames = SamplesOfInterest, refSeqName = my_ref_seq_names, mode = "paired", WL = 1000, parallel = 3)
+resHaplo_sams = cn.mops (bamDataRanges_sams, parallel = 3)
+resHaploIntCpNum_sams = calcIntegerCopyNumbers (resHaplo_sams)
+#(resHaploIntCpNum)
+segplot(resHaploIntCpNum_sams, sampleIdx = 2, ylim = c(-2,2))
+```
+
